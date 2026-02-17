@@ -331,8 +331,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         UNSUPPORTED_DEVICES: unsupported_devices,
         DISCOVERED_DEVICES: discovered_devices,
     }
-    await hass.config_entries.async_forward_entry_setups(entry, SMARTTHINQ_PLATFORMS)
 
+    await hass.config_entries.async_forward_entry_setups(entry, SMARTTHINQ_PLATFORMS)
     start_devices_discovery(hass, entry, client)
 
     return True

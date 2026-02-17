@@ -21,6 +21,7 @@ from homeassistant.const import (
     PERCENTAGE,
     STATE_UNAVAILABLE,
     EntityCategory,
+    UnitOfEnergy,
     UnitOfPower,
     UnitOfTime,
 )
@@ -181,6 +182,38 @@ WASH_DEV_SENSORS: tuple[ThinQSensorEntityDescription, ...] = (
         icon="mdi:clock-outline",
         value_fn=lambda x: x.reserve_time,
         entity_registry_enabled_default=False,
+    ),
+    ThinQSensorEntityDescription(
+        key=WashDeviceFeatures.ENERGY_ACCUMULATED,
+        name="Energy total",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+        icon="mdi:lightning-bolt",
+    ),
+    ThinQSensorEntityDescription(
+        key=WashDeviceFeatures.ENERGY_TODAY,
+        name="Energy today",
+        state_class=SensorStateClass.TOTAL,
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+        icon="mdi:calendar-today",
+    ),
+    ThinQSensorEntityDescription(
+        key=WashDeviceFeatures.ENERGY_THIS_MONTH,
+        name="Energy this month",
+        state_class=SensorStateClass.TOTAL,
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+        icon="mdi:calendar-month",
+        entity_registry_enabled_default=False,
+    ),
+    ThinQSensorEntityDescription(
+        key=WashDeviceFeatures.ENERGY_LAST_CYCLE,
+        name="Energy last cycle",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+        icon="mdi:washing-machine",
     ),
 )
 REFRIGERATOR_SENSORS: tuple[ThinQSensorEntityDescription, ...] = (

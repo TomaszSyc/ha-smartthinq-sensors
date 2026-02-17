@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from copy import deepcopy
+from datetime import datetime, timedelta
 from enum import IntEnum
 import json
 import logging
@@ -131,6 +132,10 @@ class WMDevice(Device):
         self._remote_start_pressed = False
         self._power_on_available: bool = None
         self._initial_bit_start: bool = False
+        self._energy_accumulated = None
+        self._energy_today = None
+        self._energy_this_month = None
+        self._energy_last_cycle = None
 
     @cached_property
     def _state_power_off(self):
@@ -822,15 +827,145 @@ class WMDevice(Device):
             elif int(remaining_min) > 1:
                 self._is_cycle_finishing = False
 
+    async def _fetch_energy_items(
+        self,
+        period: str,
+        start_date: str = "",
+        end_date: str = "",
+    ) -> list[dict] | None:
+        """Fetch energy history items from the LG API.
+
+        Returns the 'item' list from the API response, or None on failure.
+        """
+        try:
+            data = await self._client.session.get_energy_history(
+                self.device_info.device_id,
+                period=period,
+                start_date=start_date,
+                end_date=end_date,
+                service_type="laundry",
+            )
+            if data and isinstance(data, dict):
+                return data.get("item", [])
+            return None
+        except Exception as exc:
+            _LOGGER.error("Error fetching energy history: %s", exc)
+            return None
+
+    @staticmethod
+    def _sum_energy(items: list[dict]) -> int:
+        """Sum periodicEnergyData across a list of API items."""
+        return sum(int(item.get("periodicEnergyData", 0) or 0) for item in items)
+
+    async def get_energy_today(self) -> int | None:
+        """Get today's energy consumption in Wh."""
+        items = await self._fetch_energy_items(period="day")
+        if items is None:
+            return None
+        if not items:
+            return 0
+        energy = int(items[0].get("periodicEnergyData", 0) or 0)
+        _LOGGER.debug("Energy today: %s Wh", energy)
+        return energy
+
+    async def get_energy_this_month(self) -> int | None:
+        """Get this month's energy consumption in Wh."""
+        first_day = datetime.now().replace(day=1).strftime("%Y-%m-%d")
+        today = datetime.now().strftime("%Y-%m-%d")
+        items = await self._fetch_energy_items(
+            period="day",
+            start_date=first_day,
+            end_date=today,
+        )
+        if items is None:
+            return None
+        total = self._sum_energy(items)
+        _LOGGER.debug("Energy this month: %s Wh from %d days", total, len(items))
+        return total
+
+    async def get_energy_last_cycle(self) -> int | None:
+        """Get average energy per cycle from the most recent day with usage."""
+        week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        today = datetime.now().strftime("%Y-%m-%d")
+        items = await self._fetch_energy_items(
+            period="day",
+            start_date=week_ago,
+            end_date=today,
+        )
+        if items is None:
+            return None
+        for item in reversed(items):
+            count = int(item.get("count", 0) or 0)
+            energy = int(item.get("periodicEnergyData", 0) or 0)
+            if count > 0 and energy > 0:
+                per_cycle = energy // count
+                _LOGGER.debug(
+                    "Energy last cycle: %s Wh (%s Wh / %d cycles on %s)",
+                    per_cycle,
+                    energy,
+                    count,
+                    item.get("usedDate"),
+                )
+                return per_cycle
+        return None
+
+    async def get_energy_accumulated_from_history(self) -> int | None:
+        """Get cumulative energy for today from hourly API data in Wh.
+
+        Returns a running total that increases as each hour's energy is
+        reported. Resets to 0 at midnight; HA TOTAL_INCREASING handles
+        the reset and accumulates across days.
+        """
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        current_hour = now.strftime("%Y-%m-%d %H")
+        items = await self._fetch_energy_items(
+            period="hour",
+            start_date=today,
+            end_date=today,
+        )
+        if items is None:
+            return None
+        total = sum(
+            int(item.get("periodicEnergyData", 0) or 0)
+            for item in items
+            if item.get("usedDate", "")[:13] <= current_hour
+        )
+        _LOGGER.debug("Energy accumulated: %s Wh (up to hour %s)", total, current_hour)
+        # Return None instead of 0 to avoid TOTAL_INCREASING treating
+        # a temporary 0 (API returning empty/stale data) as a meter reset.
+        return total if total > 0 else None
+
+    async def _get_device_info_v2(self):
+        """Poll energy data from the LG API for V2 devices."""
+        self._energy_today = await self.get_energy_today()
+        self._energy_this_month = await self.get_energy_this_month()
+        self._energy_last_cycle = await self.get_energy_last_cycle()
+        self._energy_accumulated = await self.get_energy_accumulated_from_history()
+        _LOGGER.debug(
+            "Energy poll: today=%s, month=%s, cycle=%s, accumulated=%s",
+            self._energy_today,
+            self._energy_this_month,
+            self._energy_last_cycle,
+            self._energy_accumulated,
+        )
+
     async def poll(self) -> WMStatus | None:
         """Poll the device's current state."""
 
         if not self._sub_key or not self._should_poll:
-            res = await self._device_poll(self._sub_device or WM_ROOT_DATA)
+            res = await self._device_poll(
+                self._sub_device or WM_ROOT_DATA,
+            )
             if self._subkey_device and self._should_poll:
                 self._subkey_device.update_internal_state(res)
         else:
             res = self._internal_state
+
+        # Poll energy data independently of device snapshot — the energy
+        # history API works even when the device is in standby/offline.
+        if self._model_info is not None:
+            await self._additional_poll(300)
 
         if not res:
             self._stand_by = False
@@ -1204,6 +1339,44 @@ class WMStatus(DeviceStatus):
             )
             self._update_feature(feature, status, False)
 
+    def _energy_feature(self, feature: WashDeviceFeatures, value) -> int | None:
+        """Return an energy feature value, updating the feature map."""
+        if value is None:
+            return None
+        return self._update_feature(feature, value, False)
+
+    @property
+    def energy_accumulated(self):
+        """Return accumulated energy usage today in Wh (from hourly API data)."""
+        return self._energy_feature(
+            WashDeviceFeatures.ENERGY_ACCUMULATED,
+            self._device._energy_accumulated,
+        )
+
+    @property
+    def energy_today(self):
+        """Return today's energy usage in Wh."""
+        return self._energy_feature(
+            WashDeviceFeatures.ENERGY_TODAY,
+            self._device._energy_today,
+        )
+
+    @property
+    def energy_this_month(self):
+        """Return this month's energy usage in Wh."""
+        return self._energy_feature(
+            WashDeviceFeatures.ENERGY_THIS_MONTH,
+            self._device._energy_this_month,
+        )
+
+    @property
+    def energy_last_cycle(self):
+        """Return last wash cycle energy usage in Wh."""
+        return self._energy_feature(
+            WashDeviceFeatures.ENERGY_LAST_CYCLE,
+            self._device._energy_last_cycle,
+        )
+
     def _update_features(self):
         _ = [
             self.run_state,
@@ -1219,5 +1392,9 @@ class WMStatus(DeviceStatus):
             self.eco_hybrid_option_state,
             self.tubclean_count,
             self.standby_state,
+            self.energy_accumulated,
+            self.energy_today,
+            self.energy_this_month,
+            self.energy_last_cycle,
         ]
         self._update_bit_features()
